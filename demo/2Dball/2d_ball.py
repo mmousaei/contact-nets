@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-plt.switch_backend('pgf')
+# plt.switch_backend('pgf')
 
 
 def generate_figure(regenerate_data):
@@ -30,15 +30,29 @@ def generate_figure(regenerate_data):
     '''
     PHYSICS/SYSTEM PARAMETERS
     '''
-    # gravity, initial condition height, timestep, true ground height
-    g, q0, dt, GH = 9.81, 1, 1, 0
+    # gravity, timestep, true ground height, true friction coeficient
+    g, dt, GH, Mu = 9.81, 0.1, 0, 0.1
+    # initial 2D position
+    q0 = torch.tensor([1.0, 0.0]).unsqueeze(0)  # Shape [1, 2]
 
     # predictor of final state (q'v')
-    def nominalModel(v0, gh):
-        qF = q0 + v0 * dt - 0.5 * g * (dt ** 2)
-        vF = v0 - (g * dt)
-        vF[qF < gh] = 0.0
-        qF[qF < gh] = gh
+    def nominalModel(v0, gh, mu, restitution=0.8):
+        if v0.dim() == 1:
+            v0 = v0.unsqueeze(0)
+        qF_z = q0[:, 0] + v0[:, 0] * dt - 0.5 * g * dt**2
+        qF_y = q0[:, 1] + v0[:, 1] * dt
+
+        vF_z = v0[:, 0] - g * dt
+        vF_y = v0[:, 1]
+
+        contact_mask = (qF_z < gh)
+        vF_z[contact_mask] = -restitution * vF_z[contact_mask]  # Apply restitution
+        vF_y[contact_mask] *= (1 - mu)  # Apply friction
+
+        qF_z = torch.max(qF_z, torch.tensor(gh))  # Ensure the position does not go below ground height
+
+        qF = torch.stack([qF_z, qF_y], dim=1)
+        vF = torch.stack([vF_z, vF_y], dim=1)
         return torch.cat((qF, vF), dim=1)
 
 
@@ -49,69 +63,31 @@ def generate_figure(regenerate_data):
     # END-TO-END MODEL
     Nonlinearity = torch.nn.Tanh
     modelF = torch.nn.Sequential(
-        torch.nn.Linear(1, H),
+        torch.nn.Linear(2, H),
         Nonlinearity(),
         torch.nn.Linear(H, H),
         Nonlinearity(),
         torch.nn.Linear(H, H),
         Nonlinearity(),
-        torch.nn.Linear(H, 2),
+        torch.nn.Linear(H, 4),
     )
     lossF = torch.nn.MSELoss(reduction='mean')
 
 
-    class GroundHeightQP(torch.nn.Module):
-        '''GROUND-HEIGHT MODEL WITH QP LOSS.'''
-        def __init__(self, gh):
-            super().__init__()
-            self.gh = torch.nn.Parameter(gh, requires_grad=True)
-
-        def forward(self, data):
-            if self.training:
-                return self.gh
-            else:
-                return nominalModel(data, self.gh)
-
-    modelGH = GroundHeightQP(torch.randn(1)[0] * 0.3)
-
-
-    MSELOSS = torch.nn.MSELoss(reduction='mean')
-    RELU = torch.nn.ReLU()
-
-    def lossGH(gh, d):
-        v0_l = d[:, 0]
-        vf_l = d[:, 2]
-        qf_l = d[:, 1]
-
-        # extract net contact impulse
-        v_nc = v0_l - (g * dt)
-        F = vf_l - v_nc
-
-        #
-        height_above_ground = qf_l - gh
-
-        # optimal_impulse = min_impulse (height_above_ground * impulse)^2 + (F - impulse)^2
-        optimal_impulse = F / (1 + height_above_ground ** 2)
-        optimal_impulse = RELU(optimal_impulse)
-
-        return MSELOSS(height_above_ground * optimal_impulse,
-                       torch.zeros_like(height_above_ground)) \
-            + MSELOSS(optimal_impulse, F)
-
 
     # learning parameters
-    models = [modelF, modelGH]
-    losses = [lossF, lossGH]
+    models = [modelF]
+    losses = [lossF]
     testlosses = [lossF] * len(models)
     catter = lambda x_, y_: torch.cat((x_, y_), dim=1)  # noqa
     mdata = [(lambda x_, y_: x_)] * len(models)
-    ldata = [(lambda x_, y_: y_)] * (len(models) - 1) + [catter]
+    ldata = [(lambda x_, y_: y_)] * (len(models)) 
     mdata_t = [(lambda x_, y_: x_)] * len(models)
     ldata_t = [(lambda x_, y_: y_)] * len(models)
     # early_stop_epochs = [120, 50, 120, 120, 120, 120]
 
-    legend = ['Baseline', 'ContactNets (Ours)']
-    savef = ['modelF.pt', 'modelGH.pt']
+    legend = ['Baseline']
+    savef = ['modelF.pt']
     rates = [learning_rate] * len(models)
     opts = [0] * len(models)
 
@@ -128,25 +104,34 @@ def generate_figure(regenerate_data):
     '''
     # set range of initial velocities
     # center initial velocity v0 around impact
-    v_center = g / 2 * dt - q0 / dt
+    v_center_z = g / 2 * dt - q0[:, 0].squeeze() / dt
     SC = .5
-    v0min = v_center * (1 - SC)
-    v0max = v_center * (1 + SC)
-
+    v0min_z = v_center_z * (1 - SC)
+    v0max_z = v_center_z * (1 + SC)
+    v0min_y = -0.5
+    v0max_y =  0.5
     STD = 0.1  # noise standard deviation
 
     if regenerate_data:
         # generate training data
-        v0 = (v0max - v0min) * torch.rand(N, 1) + v0min
-        xf = nominalModel(v0, GH)
+        v0_z = (v0max_z - v0min_z) * torch.rand(N, 1) + v0min_z
+        v0_y = (v0max_y - v0min_y) * torch.rand(N, 1) + v0min_y
+        
+        v0 = torch.cat((v0_z.T,v0_y.T)).T
+
+        xf = nominalModel(v0, GH, Mu)
 
         # generate test data
-        v0_t = (v0max - v0min) * torch.rand(N, 1) + v0min
-        xf_t = nominalModel(v0_t, GH)
+        v0_t_z = (v0max_z - v0min_z) * torch.rand(N, 1) + v0min_z
+        v0_t_y = (v0max_y - v0min_y) * torch.rand(N, 1) + v0min_y
+        v0_t = torch.cat((v0_t_z.T,v0_t_y.T)).T
+        xf_t = nominalModel(v0_t, GH, Mu)
 
         # generate plotting data
-        v0_plot = torch.linspace(v0.min(), v0.max(), N * 100).unsqueeze(1)
-        xf_plot = nominalModel(v0_plot, GH)
+        v0_plot_z = torch.linspace(v0_z.min(), v0_z.max(), N * 100).unsqueeze(1)
+        v0_plot_y = torch.linspace(v0_y.min(), v0_y.max(), N * 100).unsqueeze(1)
+        v0_plot = torch.cat((v0_plot_z.T, v0_plot_y.T)).T
+        xf_plot = nominalModel(v0_plot, GH, Mu)
 
         # corrupt training and test data with gaussian noise
         v0 = v0 + (STD) * torch.randn(v0.shape)
@@ -157,9 +142,9 @@ def generate_figure(regenerate_data):
 
 
 
-        '''
-        LEARNING
-        '''
+    #     '''
+    #     LEARNING
+    #     '''
 
 
         x = v0
@@ -168,7 +153,7 @@ def generate_figure(regenerate_data):
         y_t = xf_t
 
         def permuteTensors(a, b):
-            perm = torch.randperm(a.nelement())
+            perm = torch.randperm(a.size(0))
             return (a[perm, :], b[perm, :])
 
         for (i, m) in enumerate(models):
@@ -186,6 +171,7 @@ def generate_figure(regenerate_data):
                     for j in range(N_batches):
                         # get batch
                         samp_j = torch.range(0, N_batch - 1).long() + j * N_batch
+                        input_tensor = mdata[i](x[samp_j, :], y[samp_j, :])
                         y_pred = m(mdata[i](x[samp_j, :], y[samp_j, :]))
 
                         # get loss
@@ -241,9 +227,9 @@ def generate_figure(regenerate_data):
     np.savetxt('adam_comp_mods.csv', CV.detach().numpy(), delimiter=',')
 
 
-    '''
-    PLOTTING
-    '''
+    # '''
+    # PLOTTING
+    # '''
 
     # matplotlib settings
     # fm = matplotlib.font_manager.json_load(
@@ -292,21 +278,19 @@ def generate_figure(regenerate_data):
 
     # plot position predicton
     fig = plt.figure(1)
-    fig.suptitle("1D System Predictions")
+    fig.suptitle("2D System Predictions")  # Assuming this is a 2D system based on your previous context
     ax1 = plt.subplot(121)
     YMIN = -0.3
-    ax1.fill_between(v0_plot.squeeze(), 0 * v0_plot.squeeze() + YMIN,
-                     color=PENNLGRAY2, label='_nolegend_')
+    ax1.fill_between(v0_plot.numpy(), 0 * v0_plot.numpy() + YMIN, color=PENNLGRAY2, label='_nolegend_')
     plt.plot(v0_plot.numpy(), qfD.numpy(), linewidth=LINEWIDTH, color=PENNYELLOW)
 
     for (i, m) in enumerate(models):
         m.eval()
         xf_pred = m(v0_plot)
         qf_pred = xf_pred[:, 0:1]
-        plt.plot(v0_plot.numpy(), qf_pred.detach().numpy(),
-                 linewidth=LINEWIDTH, color=colors[i], linestyle='dashed')
+        plt.plot(v0_plot.numpy(), qf_pred.detach().numpy(), linewidth=LINEWIDTH, color=colors[i], linestyle='dashed')
 
-    plt.scatter(v0, qf, color=PENNYELLOW)
+    plt.scatter(v0.numpy(), qf.numpy(), color=PENNYELLOW)
     plt.legend(lfinal)
 
     plt.ylabel(r"Next Position $z'$")
@@ -316,65 +300,66 @@ def generate_figure(regenerate_data):
     plt.gca().set_xlim(torch.min(v0_plot), torch.max(v0_plot))
     plt.gca().set_ylim(YMIN, torch.max(qf) + 0.1)
 
-    # plot velocity prediction
-    ax1 = plt.subplot(122)
-    plt.plot(v0_plot.numpy(), vfD.numpy(), linewidth=LINEWIDTH, color=PENNYELLOW)
+    # # plot velocity prediction
+    # ax1 = plt.subplot(122)
+    # plt.plot(v0_plot.numpy(), vfD.numpy(), linewidth=LINEWIDTH, color=PENNYELLOW)
 
-    for (i, m) in enumerate(models):
-        m.eval()
-        xf_pred = m(v0_plot)
-        vf_pred = xf_pred[:, 1:2]
-        plt.plot(v0_plot.numpy(), vf_pred.detach().numpy(),
-                 linewidth=LINEWIDTH, color=colors[i], linestyle='dashed')
+    # for (i, m) in enumerate(models):
+    #     m.eval()
+    #     xf_pred = m(v0_plot)
+    #     vf_pred = xf_pred[:, 1:2]
+    #     plt.plot(v0_plot.numpy(), vf_pred.detach().numpy(),
+    #              linewidth=LINEWIDTH, color=colors[i], linestyle='dashed')
 
-    plt.scatter(v0, vf, color=PENNYELLOW)
-    plt.ylabel(r"Next Velocity $\dot z'$")
-    plt.xlabel(r"Initial Velocity $\dot z$")
-    plt.title(r" ")
-    plt.gca().set_xlim(torch.min(v0_plot), torch.max(v0_plot))
-    # styleplot(fig,'PM_velocity.png')
+    # plt.scatter(v0, vf, color=PENNYELLOW)
+    # plt.ylabel(r"Next Velocity $\dot z'$")
+    # plt.xlabel(r"Initial Velocity $\dot z$")
+    # plt.title(r" ")
+    # plt.gca().set_xlim(torch.min(v0_plot), torch.max(v0_plot))
+    # # styleplot(fig,'PM_velocity.png')
 
-    styleplot(fig, 'PM_config.png', width=8, height=5)
+    # styleplot(fig, 'PM_config.png', width=8, height=5)
 
 
-    # plot loss and loss gradient
-    # construct ground heights
-    NG = 1000
-    GH_SCALE = dt * 10. * STD * SC
-    ghs = torch.linspace(-GH_SCALE, GH_SCALE, NG)
-    l1 = torch.zeros_like(ghs)
-    l2 = torch.zeros_like(ghs)
+    # # plot loss and loss gradient
+    # # construct ground heights
+    # NG = 1000
+    # GH_SCALE = dt * 10. * STD * SC
+    # ghs = torch.linspace(-GH_SCALE, GH_SCALE, NG)
+    # l1 = torch.zeros_like(ghs)
+    # l2 = torch.zeros_like(ghs)
 
-    for i in range(NG):
+    # for i in range(NG):
 
-        # get L2 loss
-        mod_gh = GroundHeightQP(ghs[i].clone())
-        gh = mod_gh.gh
-        mod_gh.eval()
-        xf_pred = mod_gh(v0)
-        l1[i] = lossF(xf, xf_pred).clone().detach()
-        l2[i] = lossGH(gh, torch.cat((v0, xf), dim=1)).clone().detach()
+    #     # get L2 loss
+    #     mod_gh = GroundHeightQP(ghs[i].clone())
+    #     gh = mod_gh.gh
+    #     mod_gh.eval()
+    #     xf_pred = mod_gh(v0)
+    #     l1[i] = lossF(xf, xf_pred).clone().detach()
+    #     l2[i] = lossGH(gh, torch.cat((v0, xf), dim=1)).clone().detach()
 
-    lossdata = torch.cat((ghs.unsqueeze(1), l1.unsqueeze(1), l2.unsqueeze(1)), dim=1)
-    np.savetxt('adam_comp_losses.csv', lossdata.detach().numpy(), delimiter=',')
+    # lossdata = torch.cat((ghs.unsqueeze(1), l1.unsqueeze(1), l2.unsqueeze(1)), dim=1)
+    # np.savetxt('adam_comp_losses.csv', lossdata.detach().numpy(), delimiter=',')
 
-    # normalize plots
-    # gl1 /= gl1.max()
-    # gl2 /= gl2.max()
-    # l1 /= l1.max()
-    # l2 /= l2.max()
+    # # normalize plots
+    # # gl1 /= gl1.max()
+    # # gl2 /= gl2.max()
+    # # l1 /= l1.max()
+    # # l2 /= l2.max()
 
-    fig = plt.figure(3)
-    plt.plot(ghs.numpy(), l1.detach().numpy(), linewidth=LINEWIDTH, color=PENNBLUE)
-    plt.plot(ghs.numpy(), l2.detach().numpy(), linewidth=LINEWIDTH, color=PENNRED)
-    plt.legend(['L2 Prediction', 'Mechanics-Based (Ours)'])
-    plt.title('1D System Loss')
-    plt.xlabel(r"Modeled Ground Height $\hat z_g$")
-    styleplot(fig, 'PM_loss.png', height=5)
+    # fig = plt.figure(3)
+    # plt.plot(ghs.numpy(), l1.detach().numpy(), linewidth=LINEWIDTH, color=PENNBLUE)
+    # plt.plot(ghs.numpy(), l2.detach().numpy(), linewidth=LINEWIDTH, color=PENNRED)
+    # plt.legend(['L2 Prediction', 'Mechanics-Based (Ours)'])
+    # plt.title('1D System Loss')
+    # plt.xlabel(r"Modeled Ground Height $\hat z_g$")
+    # styleplot(fig, 'PM_loss.png', height=5)
+    # plt.show()
 
 
 @click.command()
-@click.option('--regenerate_data/--plot_only', default=False)
+@click.option('--regenerate_data/--plot_only', default=True)
 def main(regenerate_data: bool):
     generate_figure(regenerate_data)
 
